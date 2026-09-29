@@ -1,8 +1,13 @@
-import streamlit as st
+import os
+import urllib.request
 import cv2
 import numpy as np
+import streamlit as st
 from PIL import Image
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision import drawing_utils, drawing_styles
 
 # Page Configuration
 st.set_page_config(
@@ -11,56 +16,66 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize MediaPipe Face Mesh
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+# Download the MediaPipe Tasks model file automatically
+MODEL_PATH = "face_landmarker.task"
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+
+@st.cache_resource
+def download_model():
+    if not os.path.exists(MODEL_PATH):
+        with st.spinner("Downloading MediaPipe Face Landmarker model..."):
+            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+
+download_model()
 
 def process_face_analysis(image_np, draw_mesh, draw_contours):
-    """Processes image through MediaPipe Face Mesh and returns annotated image and metrics."""
-    height, width, _ = image_np.shape
+    """Processes image through MediaPipe Tasks Face Landmarker API."""
     
-    # Convert RGB to BGR for MediaPipe/OpenCV processing
-    image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-    
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=2,
-        refine_landmarks=True,
-        min_detection_confidence=0.5
-    ) as face_mesh:
+    # Initialize FaceLandmarker with options
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        num_faces=2,
+        min_face_detection_confidence=0.5
+    )
+
+    annotated_image = np.copy(image_np)
+    face_detected = False
+    face_landmarks_list = []
+
+    with vision.FaceLandmarker.create_from_options(options) as landmarker:
+        # Convert numpy array to MediaPipe Image format
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_np)
         
-        results = face_mesh.process(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-        
-        annotated_image = image_bgr.copy()
-        face_detected = False
-        
-        if results.multi_face_landmarks:
+        # Run inference
+        detection_result = landmarker.detect(mp_image)
+        face_landmarks_list = detection_result.face_landmarks
+
+        if face_landmarks_list:
             face_detected = True
-            for face_landmarks in results.multi_face_landmarks:
+            for face_landmarks in face_landmarks_list:
                 if draw_mesh:
-                    # Draw standard tessellation mesh
-                    mp_drawing.draw_landmarks(
+                    # Draw full tessellation mesh
+                    drawing_utils.draw_landmarks(
                         image=annotated_image,
                         landmark_list=face_landmarks,
-                        connections=mp_face_mesh.FACEMESH_TESSELATION,
+                        connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
                         landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 128), thickness=1, circle_radius=1)
+                        connection_drawing_spec=drawing_utils.DrawingSpec(color=(0, 255, 128), thickness=1, circle_radius=1)
                     )
-                
+
                 if draw_contours:
-                    # Draw facial contours (eyes, lips, face oval)
-                    mp_drawing.draw_landmarks(
+                    # Draw facial contours
+                    drawing_utils.draw_landmarks(
                         image=annotated_image,
                         landmark_list=face_landmarks,
-                        connections=mp_face_mesh.FACEMESH_CONTOURS,
+                        connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
                         landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(255, 0, 127), thickness=2, circle_radius=1)
+                        connection_drawing_spec=drawing_utils.DrawingSpec(color=(255, 0, 127), thickness=2, circle_radius=1)
                     )
-                    
-        # Convert back to RGB for Streamlit display
-        annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
-        return annotated_image_rgb, face_detected, results.multi_face_landmarks
+
+    return annotated_image, face_detected, face_landmarks_list
 
 # --- UI Layout ---
 st.title("🧠 AIFLA Advanced Face Mesh & Emotion Studio")
@@ -80,7 +95,7 @@ uploaded_file = st.file_uploader("Choose a face image...", type=["jpg", "jpeg", 
 
 if uploaded_file is not None:
     # Load image
-    image = Image.open(uploaded_file)
+    image = Image.open(uploaded_file).convert("RGB")
     image_np = np.array(image)
     
     # Run processing pipeline
@@ -94,11 +109,11 @@ if uploaded_file is not None:
     
     with col1:
         st.subheader("📸 Original Image")
-        st.image(image, use_column_width=True)
+        st.image(image, use_container_width=True)
         
     with col2:
         st.subheader("🔬 AI Processed Output")
-        st.image(processed_image, use_column_width=True)
+        st.image(processed_image, use_container_width=True)
         
     st.divider()
     
@@ -107,7 +122,7 @@ if uploaded_file is not None:
         st.success(f"✅ Success! Detected **{len(landmarks)}** face(s) in the image.")
         
         m1, m2, m3 = st.columns(3)
-        m1.metric("Landmarks Extracted", f"{len(landmarks[0].landmark)} points")
+        m1.metric("Landmarks Extracted", f"{len(landmarks[0])} points")
         m2.metric("Primary Emotion", "Happy 😄", "Confidence: 94.8%")
         m3.metric("Mesh Status", "Active & Rendered")
         
