@@ -1,202 +1,102 @@
-import os
-import tempfile
-import urllib.request
-
-import numpy as np
-import pandas as pd
-import streamlit as st
+import av
+import cv2
 import mediapipe as mp
-from PIL import Image, ImageOps
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.vision import drawing_utils
+import numpy as np
+import streamlit as st
+from streamlit_webrtc import RTCConfiguration, webrtc_streamer
 
-# ---------------------------------------------------------------- Page config
-st.set_page_config(
-    page_title="AIFLA Face Mesh & Emotion Studio",
-    page_icon="🧠",
-    layout="wide",
+st.set_page_config(page_title="Live Camera Mesh", layout="wide")
+st.title("Live Camera Mesh")
+
+# ---------------- Sidebar controls ----------------
+mode = st.sidebar.radio("Mesh mode", ["Face mesh", "Hand mesh", "Scene mesh (Delaunay)"])
+color_hex = st.sidebar.color_picker("Mesh color", "#00FF7F")
+thickness = st.sidebar.slider("Line thickness", 1, 3, 1)
+mirror = st.sidebar.checkbox("Mirror view", True)
+black_bg = st.sidebar.checkbox("Mesh only (black background)", False)
+n_points = st.sidebar.slider("Scene mesh: number of points", 30, 400, 150, disabled=mode != "Scene mesh (Delaunay)")
+
+mp_face = mp.solutions.face_mesh
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+
+
+def hex_to_bgr(h):
+    h = h.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return (b, g, r)
+
+
+class MeshProcessor:
+    def __init__(self):
+        self.mode = "Face mesh"
+        self.color = (127, 255, 0)
+        self.thickness = 1
+        self.mirror = True
+        self.black_bg = False
+        self.n_points = 150
+        self.face = mp_face.FaceMesh(max_num_faces=2, refine_landmarks=True,
+                                     min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5,
+                                    min_tracking_confidence=0.5)
+
+    def _scene_mesh(self, img, canvas):
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        corners = cv2.goodFeaturesToTrack(gray, maxCorners=self.n_points,
+                                          qualityLevel=0.01, minDistance=max(10, w // 40))
+        pts = [] if corners is None else [tuple(map(float, p.ravel())) for p in corners]
+        # frame anchors so the mesh covers the whole image
+        for x in (0, w // 2, w - 1):
+            for y in (0, h // 2, h - 1):
+                pts.append((float(x), float(y)))
+        subdiv = cv2.Subdiv2D((0, 0, w, h))
+        for p in pts:
+            try:
+                subdiv.insert(p)
+            except cv2.error:
+                pass
+        for t in subdiv.getTriangleList():
+            tri = [(int(t[0]), int(t[1])), (int(t[2]), int(t[3])), (int(t[4]), int(t[5]))]
+            if all(0 <= x < w and 0 <= y < h for x, y in tri):
+                cv2.polylines(canvas, [np.array(tri)], True, self.color, self.thickness, cv2.LINE_AA)
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        if self.mirror:
+            img = cv2.flip(img, 1)
+        canvas = np.zeros_like(img) if self.black_bg else img.copy()
+        spec = mp_draw.DrawingSpec(color=self.color, thickness=self.thickness, circle_radius=0)
+
+        if self.mode == "Face mesh":
+            res = self.face.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            for lm in (res.multi_face_landmarks or []):
+                mp_draw.draw_landmarks(canvas, lm, mp_face.FACEMESH_TESSELATION, None, spec)
+                mp_draw.draw_landmarks(canvas, lm, mp_face.FACEMESH_CONTOURS, None,
+                                       mp_draw.DrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0))
+        elif self.mode == "Hand mesh":
+            res = self.hands.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            for lm in (res.multi_hand_landmarks or []):
+                mp_draw.draw_landmarks(canvas, lm, mp_hands.HAND_CONNECTIONS,
+                                       mp_draw.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=3), spec)
+        else:
+            self._scene_mesh(img, canvas)
+
+        return av.VideoFrame.from_ndarray(canvas, format="bgr24")
+
+
+ctx = webrtc_streamer(
+    key="mesh",
+    video_processor_factory=MeshProcessor,
+    rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+    media_stream_constraints={"video": {"width": 960, "height": 540}, "audio": False},
+    async_processing=True,
 )
 
-MODEL_PATH = "face_landmarker.task"
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-    "face_landmarker/float16/1/face_landmarker.task"
-)
-MAX_SIDE = 1280  # downscale huge photos for speed
+# push sidebar settings into the running video processor
+if ctx.video_processor:
+    p = ctx.video_processor
+    p.mode, p.color, p.thickness = mode, hex_to_bgr(color_hex), thickness
+    p.mirror, p.black_bg, p.n_points = mirror, black_bg, n_points
 
-
-# ------------------------------------------------------------------- Model
-@st.cache_resource(show_spinner="Downloading MediaPipe Face Landmarker model...")
-def download_model() -> str:
-    if not os.path.exists(MODEL_PATH):
-        # Download to a temp file first so a failed download never leaves a corrupt model
-        fd, tmp_path = tempfile.mkstemp(suffix=".task")
-        os.close(fd)
-        try:
-            urllib.request.urlretrieve(MODEL_URL, tmp_path)
-            os.replace(tmp_path, MODEL_PATH)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-    return MODEL_PATH
-
-
-@st.cache_resource(show_spinner=False)
-def get_landmarker(model_path: str, num_faces: int, min_conf: float):
-    """Create the FaceLandmarker once per settings combo (not on every rerun)."""
-    options = vision.FaceLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path=model_path),
-        running_mode=vision.RunningMode.IMAGE,
-        num_faces=num_faces,
-        min_face_detection_confidence=min_conf,
-        min_face_presence_confidence=min_conf,
-        output_face_blendshapes=True,  # used for the emotion estimate
-    )
-    return vision.FaceLandmarker.create_from_options(options)
-
-
-# ----------------------------------------------------------------- Emotion
-def estimate_emotions(blendshapes) -> dict:
-    """
-    Heuristic emotion scores from MediaPipe's 52 facial blendshapes.
-    This is a simple rule-based demo, NOT a trained emotion classifier.
-    Swap it for DeepFace or your own CNN for real emotion recognition.
-    """
-    b = {c.category_name: c.score for c in blendshapes}
-
-    def avg(*names):
-        return float(np.mean([b.get(n, 0.0) for n in names]))
-
-    happy = avg("mouthSmileLeft", "mouthSmileRight") * 1.2 + avg(
-        "cheekSquintLeft", "cheekSquintRight"
-    ) * 0.4
-    surprised = (
-        avg("jawOpen") * 0.6
-        + avg("browInnerUp", "browOuterUpLeft", "browOuterUpRight") * 0.8
-        + avg("eyeWideLeft", "eyeWideRight") * 0.8
-    )
-    sad = avg("mouthFrownLeft", "mouthFrownRight") * 1.0 + avg("browInnerUp") * 0.4
-    angry = (
-        avg("browDownLeft", "browDownRight") * 1.0
-        + avg("noseSneerLeft", "noseSneerRight") * 0.6
-        + avg("mouthPressLeft", "mouthPressRight") * 0.4
-    )
-    strongest = max(happy, surprised, sad, angry)
-    neutral = max(0.0, 0.6 - strongest)
-
-    scores = {
-        "Happy": happy,
-        "Neutral": neutral,
-        "Surprised": surprised,
-        "Sad": sad,
-        "Angry": angry,
-    }
-    total = sum(scores.values()) or 1.0
-    return {k: v / total for k, v in scores.items()}
-
-
-EMOJI = {"Happy": "😄", "Neutral": "😐", "Surprised": "😲", "Sad": "😢", "Angry": "😠"}
-
-
-# ---------------------------------------------------------------- Pipeline
-def process_face_analysis(image_np, landmarker, draw_mesh, draw_contours):
-    annotated = np.ascontiguousarray(image_np.copy())
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(image_np))
-    result = landmarker.detect(mp_image)
-
-    for face_landmarks in result.face_landmarks:
-        if draw_mesh:
-            drawing_utils.draw_landmarks(
-                image=annotated,
-                landmark_list=face_landmarks,
-                connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=drawing_utils.DrawingSpec(
-                    color=(0, 255, 128), thickness=1
-                ),
-            )
-        if draw_contours:
-            drawing_utils.draw_landmarks(
-                image=annotated,
-                landmark_list=face_landmarks,
-                connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=drawing_utils.DrawingSpec(
-                    color=(255, 0, 127), thickness=2
-                ),
-            )
-
-    return annotated, result
-
-
-# ---------------------------------------------------------------------- UI
-st.title("🧠 AIFLA Advanced Face Mesh & Emotion Studio")
-st.markdown("Upload a portrait to extract dense 3D facial landmarks and estimate expression.")
-
-model_path = download_model()
-
-with st.sidebar:
-    st.header("⚙️ Configuration Controls")
-    st.markdown("Customize the computer vision pipeline:")
-    draw_tesselation = st.checkbox("Draw Full Face Mesh", value=True)
-    draw_facial_contours = st.checkbox("Highlight Facial Contours", value=True)
-    num_faces = st.slider("Max faces", 1, 5, 2)
-    min_conf = st.slider("Min detection confidence", 0.1, 1.0, 0.5, 0.05)
-
-    st.divider()
-    st.info(
-        "💡 **AIFLA Student Tip**: The emotion module uses a simple blendshape "
-        "heuristic. Plug in DeepFace or a custom PyTorch CNN for real classification!"
-    )
-
-uploaded_file = st.file_uploader("Choose a face image...", type=["jpg", "jpeg", "png"])
-
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    image = ImageOps.exif_transpose(image).convert("RGB")  # fix phone-photo rotation
-    image.thumbnail((MAX_SIDE, MAX_SIDE))
-    image_np = np.array(image)
-
-    landmarker = get_landmarker(model_path, num_faces, min_conf)
-
-    with st.spinner("Running MediaPipe Face Landmarker..."):
-        processed_image, result = process_face_analysis(
-            image_np, landmarker, draw_tesselation, draw_facial_contours
-        )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("📸 Original Image")
-        st.image(image, width="stretch")
-    with col2:
-        st.subheader("🔬 AI Processed Output")
-        st.image(processed_image, width="stretch")
-
-    st.divider()
-
-    if result.face_landmarks:
-        st.success(f"✅ Detected **{len(result.face_landmarks)}** face(s) in the image.")
-
-        emotions = estimate_emotions(result.face_blendshapes[0])
-        top = max(emotions, key=emotions.get)
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Landmarks Extracted", f"{len(result.face_landmarks[0])} points")
-        m2.metric(
-            "Primary Emotion (face 1)",
-            f"{top} {EMOJI[top]}",
-            f"Score: {emotions[top] * 100:.1f}%",
-            delta_color="off",
-        )
-        m3.metric("Mesh Status", "Active & Rendered" if draw_tesselation else "Hidden")
-
-        st.write("### 📊 Emotion Probability Distribution")
-        df = pd.DataFrame({"Emotion": list(emotions), "Probability": list(emotions.values())})
-        st.bar_chart(df, x="Emotion", y="Probability", horizontal=True)
-    else:
-        st.warning(
-            "⚠️ No clear face detected. Try an image with better front-facing lighting and visibility."
-        )
-else:
-    st.info("👉 Get started by uploading an image using the file uploader above.")
+st.caption("Click START and allow camera access. Camera works on localhost or HTTPS only.")
